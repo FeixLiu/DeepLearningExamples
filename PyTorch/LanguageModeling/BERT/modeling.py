@@ -893,13 +893,41 @@ class BertForPreTraining(BertPreTrainedModel):
         self.bert = BertModel(config)
         self.cls = BertPreTrainingHeads(config, self.bert.embeddings.word_embeddings.weight)
         self.apply(self.init_bert_weights)
+        self.dense_seq_output = False # config.dense_seq_output
 
-    def forward(self, input_ids, token_type_ids, attention_mask):
+    def forward(self, input_ids, token_type_ids, attention_mask, masked_lm_labels=None, next_sentence_label=None):
         encoded_layers, pooled_output = self.bert(input_ids, token_type_ids, attention_mask)
         sequence_output = encoded_layers[-1]
         prediction_scores, seq_relationship_score = self.cls(sequence_output, pooled_output)
 
-        return prediction_scores, seq_relationship_score
+        if self.dense_seq_output:
+            masked_lm_labels_flat = masked_lm_labels.view(-1)
+            mlm_labels = masked_lm_labels_flat[masked_lm_labels_flat != -1]
+
+        if masked_lm_labels is not None and next_sentence_label is not None:
+            loss_fct = CrossEntropyLoss(ignore_index=-1)
+            if self.dense_seq_output:
+                masked_lm_loss = loss_fct(prediction_scores.view(-1, self.config.vocab_size), mlm_labels.view(-1))
+            else:
+                masked_lm_loss = loss_fct(prediction_scores.view(-1, self.config.vocab_size), masked_lm_labels.view(-1))
+            next_sentence_loss = loss_fct(seq_relationship_score.view(-1, 2), next_sentence_label.view(-1))
+            #print("loss is {} {}".format(masked_lm_loss, next_sentence_loss))
+            total_loss = masked_lm_loss + next_sentence_loss
+
+            # Masked Language Model Accuracy
+            if not self.dense_seq_output:
+                prediction_scores_flat = prediction_scores.view(-1, prediction_scores.shape[-1])
+                masked_lm_labels_flat = masked_lm_labels.view(-1)
+                mlm_predictions_scores = prediction_scores_flat[masked_lm_labels_flat != -1]
+                mlm_predictions = mlm_predictions_scores.argmax(dim=-1)
+                mlm_labels = masked_lm_labels_flat[masked_lm_labels_flat != -1]
+            else:
+                mlm_predictions = prediction_scores.argmax(dim=-1)
+            mlm_acc = (mlm_predictions == mlm_labels).sum(dtype=torch.float)/mlm_labels.numel()
+
+            return total_loss, mlm_acc, mlm_labels.numel()
+        else: #TODO: Handle this path for dense sequence output as well
+            return prediction_scores, seq_relationship_score
 
 
 class BertForMaskedLM(BertPreTrainedModel):

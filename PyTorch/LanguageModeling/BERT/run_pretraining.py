@@ -83,10 +83,46 @@ def create_pretraining_dataset(input_file, max_pred_length, shared_list, args, w
     train_data = pretraining_dataset(input_file=input_file, max_pred_length=max_pred_length)
     train_sampler = RandomSampler(train_data)
     train_dataloader = DataLoader(train_data, sampler=train_sampler,
-                                  batch_size=args.train_batch_size * args.n_gpu, 
+                                  batch_size=args.train_batch_size * args.n_gpu,
                                   num_workers=4, worker_init_fn=worker_init,
                                   pin_memory=True)
     return train_dataloader, input_file
+
+
+def create_eval_dataset(args, worker_init_fn):
+    eval_data = []
+    for eval_file in sorted(os.listdir(args.eval_dir)):
+        eval_file_path = os.path.join(args.eval_dir, eval_file)
+        if os.path.isfile(eval_file_path):
+            eval_data.extend(
+                pretraining_dataset(
+                    eval_file_path,
+                    max_pred_length=args.max_predictions_per_seq))
+            if len(eval_data) > args.num_eval_examples:
+                eval_data = eval_data[:args.num_eval_examples]
+                break
+    if torch.distributed.is_initialized():
+        chunk_size = args.num_eval_examples // torch.distributed.get_world_size(
+        )
+        rank = torch.distributed.get_rank()
+        remainder = args.num_eval_examples % torch.distributed.get_world_size()
+        if rank < remainder:
+            eval_data = eval_data[(chunk_size + 1) * rank:(chunk_size + 1) *
+                                  (rank + 1)]
+        else:
+            eval_data = eval_data[chunk_size * rank + remainder:chunk_size *
+                                  (rank + 1) + remainder]
+
+    eval_sampler = SequentialSampler(eval_data)
+    eval_dataloader = DataLoader(eval_data,
+                                 sampler=eval_sampler,
+                                 batch_size=args.eval_batch_size,
+                                 num_workers=4,
+                                 worker_init_fn=worker_init_fn,
+                                 pin_memory=True)
+
+    return eval_dataloader
+
 
 class pretraining_dataset(Dataset):
 
@@ -278,13 +314,50 @@ def parse_arguments():
                         help='Disable tqdm progress bar')
     parser.add_argument('--steps_this_run', type=int, default=-1,
                         help='If provided, only run this many steps before exiting')
+    parser.add_argument(
+        '--target_mlm_accuracy',
+        type=float,
+        default=0.712,
+        help="Stop training after reaching this Masked-LM accuracy")
+    parser.add_argument(
+        '--train_mlm_accuracy_window_size',
+        type=int,
+        default=10,
+        help=
+        "Average accuracy over this amount of batches before performing a stopping criterion test"
+    )
+    parser.add_argument("--eval_batch_size",
+                        default=128,
+                        type=int,
+                        help="Total batch size for training.")
+    parser.add_argument("--eval_dir",
+                        default=None,
+                        type=str,
+                        help="The eval data dir. Should contain .hdf5 files  for the task.")
+    parser.add_argument("--eval_iter_start_samples",
+                        default=10,
+                        type=int,
+                        help="Sample to begin performing eval.")
+    parser.add_argument("--eval_iter_samples",
+                        default=100,
+                        type=int,
+                        help="If set to -1, disable eval, \
+                        else evaluate every eval_iter_samples during training"                                                                                                                                                            )
+    parser.add_argument("--num_eval_examples",
+                        default=10000,
+                        type=int,
+                        help="number of eval examples to run eval on")
+    parser.add_argument("--cache_eval_data",
+                        default=False,
+                        action='store_true',
+                        help="whether to cache evaluation data on GPU")
 
     args = parser.parse_args()
     args.fp16 = args.fp16 or args.amp
 
     if args.steps_this_run < 0:
         args.steps_this_run = args.max_steps
-    
+
     return args
 
 def setup_training(args):
@@ -302,11 +375,11 @@ def setup_training(args):
         # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
         torch.distributed.init_process_group(backend='nccl', init_method='env://')
         args.n_gpu = 1
-        
+
     if args.gradient_accumulation_steps == 1:
         args.allreduce_post_accumulation = False
         args.allreduce_post_accumulation_fp16 = False
-        
+
     if is_main_process():
         dllogger.init(backends=[dllogger.JSONStreamBackend(verbosity=dllogger.Verbosity.VERBOSE,
                                                            filename=args.json_summary),
@@ -366,7 +439,7 @@ def prepare_model_and_optimizer(args, device):
             checkpoint = torch.load(args.init_checkpoint, map_location="cpu")
 
         model.load_state_dict(checkpoint['model'], strict=False)
-        
+
         if args.phase2 and not args.init_checkpoint:
             global_step -= args.phase1_end_step
         if is_main_process():
@@ -375,15 +448,15 @@ def prepare_model_and_optimizer(args, device):
     model.to(device)
     param_optimizer = list(model.named_parameters())
     no_decay = ['bias', 'gamma', 'beta', 'LayerNorm']
-    
+
     optimizer_grouped_parameters = [
         {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], 'weight_decay': 0.01},
         {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}]
 
-    optimizer = FusedLAMB(optimizer_grouped_parameters, 
+    optimizer = FusedLAMB(optimizer_grouped_parameters,
                           lr=args.learning_rate)
-    lr_scheduler = PolyWarmUpScheduler(optimizer, 
-                                       warmup=args.warmup_proportion, 
+    lr_scheduler = PolyWarmUpScheduler(optimizer,
+                                       warmup=args.warmup_proportion,
                                        total_steps=args.max_steps)
     if args.fp16:
 
@@ -408,7 +481,7 @@ def prepare_model_and_optimizer(args, device):
                 checkpoint['optimizer']['param_groups'][iter]['lr'] = args.learning_rate
         optimizer.load_state_dict(checkpoint['optimizer'])  # , strict=False)
 
-        # Restore AMP master parameters          
+        # Restore AMP master parameters
         if args.fp16:
             optimizer._lazy_init_maybe_master_weights()
             optimizer._amp_stash.lazy_init_called = True
@@ -488,11 +561,58 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, global_step):
 
     return global_step
 
+
+cached_batches = []
+
+
+def run_eval(model,
+             eval_dataloader,
+             device,
+             num_eval_examples,
+             first_eval=False,
+             use_cache=False):
+    model.eval()
+
+    total_eval_loss, total_eval_mlm_acc = 0.0, 0.0
+    total_masked = 0
+
+    # on first eval, load and cache data on GPU
+    if first_eval and use_cache:
+        for batch in eval_dataloader:
+            cached_batches.append([t.to(device) for t in batch])
+
+    with torch.no_grad():
+        for batch in cached_batches if use_cache else eval_dataloader:
+            if not use_cache: batch = [t.to(device) for t in batch]
+            input_ids, segment_ids, input_mask, masked_lm_labels, next_sentence_labels = batch
+            loss, mlm_acc, num_masked = model(input_ids=input_ids, token_type_ids=segment_ids, attention_mask=input_mask,
+                                  masked_lm_labels=masked_lm_labels, next_sentence_label=next_sentence_labels)
+            total_eval_loss += loss * num_masked
+            total_eval_mlm_acc += mlm_acc * num_masked
+            total_masked += num_masked
+    model.train()
+
+    #total_eval_mlm_acc and total_eval_loss are already tensors, total_masked is not
+    total_masked = torch.tensor(total_masked, device=device, dtype=torch.int64)
+
+    if torch.distributed.is_initialized():
+        #Collect total scores from all ranks
+        torch.distributed.all_reduce(total_eval_mlm_acc, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(total_eval_loss, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(total_masked, op=torch.distributed.ReduceOp.SUM)
+
+    # Average by number of examples
+    total_eval_mlm_acc /= total_masked
+    total_eval_loss /= total_masked
+
+    return total_eval_loss.item(), total_eval_mlm_acc.item()
+
+
 def main():
     global timeout_sent
 
     args = parse_arguments()
-        
+
     random.seed(args.seed + args.local_rank)
     np.random.seed(args.seed + args.local_rank)
     torch.manual_seed(args.seed + args.local_rank)
@@ -520,8 +640,22 @@ def main():
         average_loss = 0.0  # averaged loss every args.log_freq steps
         epoch = 0
         training_steps = 0
+        end_training, converged = False, False
+        samples_trained_prev = 0
+        eval_count = 0
 
         pool = ProcessPoolExecutor(1)
+
+        if args.target_mlm_accuracy:
+            if args.train_mlm_accuracy_window_size > 0:
+                accuracy_scores = []
+                avg_mlm_accuracy = torch.Tensor([0]).cuda()
+
+        # Start prefetching eval dataset
+        if args.eval_dir:
+            eval_dataset_future = pool.submit(create_eval_dataset,
+                                              args,
+                                              worker_init_fn=worker_init)
 
         # Note: We loop infinitely over epochs, termination is handled via iteration count
         while True:
@@ -570,8 +704,8 @@ def main():
                 overflow_buf = torch.cuda.IntTensor([0])
 
             for f_id in range(f_start_id + 1 , len(files)):
-                
-   
+
+
                 if get_world_size() > num_files:
                     data_file = files[(f_id*get_world_size()+get_rank() + remainder*f_id)%num_files]
                 else:
@@ -590,8 +724,11 @@ def main():
                     training_steps += 1
                     batch = [t.to(device) for t in batch]
                     input_ids, segment_ids, input_mask, masked_lm_labels, next_sentence_labels = batch
-                    prediction_scores, seq_relationship_score = model(input_ids=input_ids, token_type_ids=segment_ids, attention_mask=input_mask)
-                    loss = criterion(prediction_scores, seq_relationship_score, masked_lm_labels, next_sentence_labels)
+                    # prediction_scores, seq_relationship_score = model(input_ids=input_ids, token_type_ids=segment_ids, attention_mask=input_mask)
+                    # loss = criterion(prediction_scores, seq_relationship_score, masked_lm_labels, next_sentence_labels)
+                    loss, mlm_acc, _ = model(input_ids=input_ids, token_type_ids=segment_ids, attention_mask=input_mask,
+                                    masked_lm_labels=masked_lm_labels, next_sentence_label=next_sentence_labels)
+
                     if args.n_gpu > 1:
                         loss = loss.mean()  # mean() to average on multi-gpu.
 
@@ -611,6 +748,34 @@ def main():
                     if training_steps % args.gradient_accumulation_steps == 0:
                         lr_scheduler.step()  # learning rate warmup
                         global_step = take_optimizer_step(args, optimizer, model, overflow_buf, global_step)
+                        samples_trained = global_step * args.train_batch_size * args.gradient_accumulation_steps * args.n_gpu
+
+                        if (args.eval_dir and args.eval_iter_samples > 0 and
+                            samples_trained >= args.eval_iter_start_samples + eval_count * args.eval_iter_samples):
+                            # on first eval, get eval_dataloader
+                            if eval_count == 0:
+                                eval_dataloader = eval_dataset_future.result(timeout=None)
+
+                            samples_trained_prev = samples_trained
+                            eval_avg_loss, eval_avg_mlm_accuracy = run_eval(model, eval_dataloader, device, args.num_eval_examples,
+                                                                            first_eval=(eval_count == 0), use_cache=args.cache_eval_data)
+                            if is_main_process():
+                                print({"global_steps": global_step, "eval_loss": eval_avg_loss, "eval_mlm_accuracy":eval_avg_mlm_accuracy})
+                            if args.target_mlm_accuracy:
+                                if eval_avg_mlm_accuracy >= args.target_mlm_accuracy:
+                                    end_training, converged = True, True
+                                    if is_main_process():
+                                        print("%f > %f, Target MLM Accuracy reached at %d"%(eval_avg_mlm_accuracy, args.target_mlm_accuracy, global_step))
+
+                            eval_count += 1
+                    # For mlm_accuracy
+                    if args.target_mlm_accuracy and args.train_mlm_accuracy_window_size > 0:
+                        accuracy_scores.append(mlm_acc)
+                        if training_steps % args.gradient_accumulation_steps == 0:
+                            accuracy_scores = accuracy_scores[-args.train_mlm_accuracy_window_size * args.gradient_accumulation_steps:]
+                            avg_mlm_accuracy[0] = sum(accuracy_scores) / len(accuracy_scores)
+                            torch.distributed.all_reduce(avg_mlm_accuracy, op=torch.distributed.ReduceOp.SUM)
+                            avg_mlm_accuracy /= torch.distributed.get_world_size()
 
                     if global_step >= args.steps_this_run or timeout_sent:
                         train_time_raw = time.time() - raw_train_start
@@ -626,7 +791,13 @@ def main():
                             dllogger.log(step=(epoch, global_step, ), data={"final_loss": final_loss})
                     elif training_steps % (args.log_freq * args.gradient_accumulation_steps) == 0:
                         if is_main_process():
-                            dllogger.log(step=(epoch, global_step, ), data={"average_loss": average_loss / (args.log_freq * divisor),
+                            if args.train_mlm_accuracy_window_size > 0:
+                                dllogger.log(step=(epoch, global_step, ), data={"average_loss": average_loss / (args.log_freq * divisor),
+                                                                            "step_loss": loss.item() * args.gradient_accumulation_steps / divisor,
+                                                                            "learning_rate": optimizer.param_groups[0]['lr'],
+                                                                            "mlm_accuracy": avg_mlm_accuracy[0].item()})
+                            else:
+                                dllogger.log(step=(epoch, global_step, ), data={"average_loss": average_loss / (args.log_freq * divisor),
                                                                             "step_loss": loss.item() * args.gradient_accumulation_steps / divisor,
                                                                             "learning_rate": optimizer.param_groups[0]['lr']})
                         average_loss = 0
@@ -656,7 +827,7 @@ def main():
                                     ckpt_to_be_removed = most_recent_ckpts_paths.pop(0)
                                     os.remove(ckpt_to_be_removed)
 
-                        # Exiting the training due to hitting max steps, or being sent a 
+                        # Exiting the training due to hitting max steps, or being sent a
                         # timeout from the cluster scheduler
                         if global_step >= args.steps_this_run or timeout_sent:
                             del train_dataloader
