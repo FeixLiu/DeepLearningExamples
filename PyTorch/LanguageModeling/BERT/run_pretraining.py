@@ -314,18 +314,14 @@ def parse_arguments():
                         help='Disable tqdm progress bar')
     parser.add_argument('--steps_this_run', type=int, default=-1,
                         help='If provided, only run this many steps before exiting')
-    parser.add_argument(
-        '--target_mlm_accuracy',
-        type=float,
-        default=0.712,
-        help="Stop training after reaching this Masked-LM accuracy")
-    parser.add_argument(
-        '--train_mlm_accuracy_window_size',
-        type=int,
-        default=10,
-        help=
-        "Average accuracy over this amount of batches before performing a stopping criterion test"
-    )
+    parser.add_argument('--target_mlm_accuracy',
+                        type=float,
+                        default=0.712,
+                        help="Stop training after reaching this Masked-LM accuracy")
+    parser.add_argument('--train_mlm_accuracy_window_size',
+                        type=int,
+                        default=10,
+                        help="Average accuracy over this amount of batches before performing a stopping criterion test")
     parser.add_argument("--eval_batch_size",
                         default=128,
                         type=int,
@@ -565,7 +561,8 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, global_step):
 cached_batches = []
 
 
-def run_eval(model,
+def run_eval(args,
+             model,
              eval_dataloader,
              device,
              num_eval_examples,
@@ -587,6 +584,9 @@ def run_eval(model,
             input_ids, segment_ids, input_mask, masked_lm_labels, next_sentence_labels = batch
             loss, mlm_acc, num_masked = model(input_ids=input_ids, token_type_ids=segment_ids, attention_mask=input_mask,
                                   masked_lm_labels=masked_lm_labels, next_sentence_label=next_sentence_labels)
+            if args.fp16:   # incase of overflow, cast the tf16 loss and acc to tf32
+                loss = loss.type(torch.cuda.FloatTensor)
+                mlm_acc = mlm_acc.type(torch.cuda.FloatTensor)
             total_eval_loss += loss * num_masked
             total_eval_mlm_acc += mlm_acc * num_masked
             total_masked += num_masked
@@ -757,7 +757,7 @@ def main():
                                 eval_dataloader = eval_dataset_future.result(timeout=None)
 
                             samples_trained_prev = samples_trained
-                            eval_avg_loss, eval_avg_mlm_accuracy = run_eval(model, eval_dataloader, device, args.num_eval_examples,
+                            eval_avg_loss, eval_avg_mlm_accuracy = run_eval(args, model, eval_dataloader, device, args.num_eval_examples,
                                                                             first_eval=(eval_count == 0), use_cache=args.cache_eval_data)
                             if is_main_process():
                                 print({"global_steps": global_step, "eval_loss": eval_avg_loss, "eval_mlm_accuracy":eval_avg_mlm_accuracy})
