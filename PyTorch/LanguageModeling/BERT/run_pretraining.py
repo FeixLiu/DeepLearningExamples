@@ -542,7 +542,7 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, global_step):
             skipped_steps += 1
             if is_main_process():
                 scaler = _amp_state.loss_scalers[0]
-                dllogger.log(step="PARAMETER", data={"loss_scale": scaler.loss_scale()})
+                #dllogger.log(step="PARAMETER", data={"loss_scale": scaler.loss_scale()})
             if _amp_state.opt_properties.master_weights:
                 for param in optimizer._amp_stash.all_fp32_from_fp16_params:
                     param.grad = None
@@ -620,20 +620,20 @@ def main():
     worker_init = WorkerInitObj(args.seed + args.local_rank)
 
     device, args = setup_training(args)
-    dllogger.log(step="PARAMETER", data={"Config": [str(args)]})
+    #dllogger.log(step="PARAMETER", data={"Config": [str(args)]})
 
     # Prepare optimizer
     model, optimizer, lr_scheduler, checkpoint, global_step, criterion = prepare_model_and_optimizer(args, device)
 
-    if is_main_process():
-        dllogger.log(step="PARAMETER", data={"SEED": args.seed})
+    # if is_main_process():
+    #     dllogger.log(step="PARAMETER", data={"SEED": args.seed})
 
     raw_train_start = None
     if args.do_train:
-        if is_main_process():
-            dllogger.log(step="PARAMETER", data={"train_start": True})
-            dllogger.log(step="PARAMETER", data={"batch_size_per_gpu": args.train_batch_size})
-            dllogger.log(step="PARAMETER", data={"learning_rate": args.learning_rate})
+        # if is_main_process():
+        #     dllogger.log(step="PARAMETER", data={"train_start": True})
+        #     dllogger.log(step="PARAMETER", data={"batch_size_per_gpu": args.train_batch_size})
+        #     dllogger.log(step="PARAMETER", data={"learning_rate": args.learning_rate})
 
         model.train()
         most_recent_ckpts_paths = []
@@ -658,6 +658,9 @@ def main():
                                               worker_init_fn=worker_init)
 
         # Note: We loop infinitely over epochs, termination is handled via iteration count
+        start = time.time()
+        print('- AI-Rank-log ', start, ' load_data')
+        print('- AI-Rank-log ', start, ' test_begin')
         while True:
             thread = None
             restored_data_loader = None
@@ -715,7 +718,8 @@ def main():
 
                 dataset_future = pool.submit(create_pretraining_dataset, data_file, args.max_predictions_per_seq, shared_file_list, args, worker_init)
 
-                train_iter = tqdm(train_dataloader, desc="Iteration", disable=args.disable_progress_bar) if is_main_process() else train_dataloader
+                #train_iter = tqdm(train_dataloader, desc="Iteration", disable=args.disable_progress_bar) if is_main_process() else train_dataloader
+                train_iter = train_dataloader
 
                 if raw_train_start is None:
                     raw_train_start = time.time()
@@ -760,7 +764,7 @@ def main():
                             eval_avg_loss, eval_avg_mlm_accuracy = run_eval(args, model, eval_dataloader, device, args.num_eval_examples,
                                                                             first_eval=(eval_count == 0), use_cache=args.cache_eval_data)
                             if is_main_process():
-                                print({"global_steps": global_step, "eval_loss": eval_avg_loss, "eval_mlm_accuracy":eval_avg_mlm_accuracy})
+                                print({"epoch": epoch, "global_steps": global_step, "eval_loss": eval_avg_loss, "eval_mlm_accuracy":eval_avg_mlm_accuracy})
                             if args.target_mlm_accuracy:
                                 if eval_avg_mlm_accuracy >= args.target_mlm_accuracy:
                                     end_training, converged = True, True
@@ -787,19 +791,21 @@ def main():
                             average_loss /= get_world_size()
                             torch.distributed.all_reduce(average_loss)
                         final_loss = average_loss.item()
-                        if is_main_process():
-                            dllogger.log(step=(epoch, global_step, ), data={"final_loss": final_loss})
+                        # if is_main_process():
+                        #     dllogger.log(step=(epoch, global_step, ), data={"final_loss": final_loss})
                     elif training_steps % (args.log_freq * args.gradient_accumulation_steps) == 0:
                         if is_main_process():
                             if args.train_mlm_accuracy_window_size > 0:
-                                dllogger.log(step=(epoch, global_step, ), data={"average_loss": average_loss / (args.log_freq * divisor),
-                                                                            "step_loss": loss.item() * args.gradient_accumulation_steps / divisor,
-                                                                            "learning_rate": optimizer.param_groups[0]['lr'],
-                                                                            "mlm_accuracy": avg_mlm_accuracy[0].item()})
+                                pass
+                                # dllogger.log(step=(epoch, global_step, ), data={"average_loss": average_loss / (args.log_freq * divisor),
+                                #                                             "step_loss": loss.item() * args.gradient_accumulation_steps / divisor,
+                                #                                             "learning_rate": optimizer.param_groups[0]['lr'],
+                                #                                             "mlm_accuracy": avg_mlm_accuracy[0].item()})
                             else:
-                                dllogger.log(step=(epoch, global_step, ), data={"average_loss": average_loss / (args.log_freq * divisor),
-                                                                            "step_loss": loss.item() * args.gradient_accumulation_steps / divisor,
-                                                                            "learning_rate": optimizer.param_groups[0]['lr']})
+                                pass
+                                # dllogger.log(step=(epoch, global_step, ), data={"average_loss": average_loss / (args.log_freq * divisor),
+                                #                                             "step_loss": loss.item() * args.gradient_accumulation_steps / divisor,
+                                #                                             "learning_rate": optimizer.param_groups[0]['lr']})
                         average_loss = 0
 
 
@@ -807,7 +813,7 @@ def main():
                             args.num_steps_per_checkpoint * args.gradient_accumulation_steps) == 0 or timeout_sent:
                         if is_main_process() and not args.skip_checkpoint:
                             # Save a trained model
-                            dllogger.log(step="PARAMETER", data={"checkpoint_step": global_step})
+                            # dllogger.log(step="PARAMETER", data={"checkpoint_step": global_step})
                             model_to_save = model.module if hasattr(model,
                                                                     'module') else model  # Only save the model it-self
                             if args.resume_step < 0 or not args.phase2:
@@ -840,6 +846,21 @@ def main():
                 # NOTE: Will block until complete
                 train_dataloader, data_file = dataset_future.result(timeout=None)
 
+            del eval_dataloader
+            eval_dataloader = eval_dataset_future.result(timeout=None)
+            eval_avg_loss, eval_avg_mlm_accuracy = run_eval(args, model, eval_dataloader, device,
+                                                            args.num_eval_examples,
+                                                            first_eval=(eval_count == 0),
+                                                            use_cache=args.cache_eval_data)
+            if is_main_process():
+                print('- AI-Rank-log ', time.time(), ' eval_accuracy:', eval_avg_mlm_accuracy, ', total_epoch_cnt:', epoch + 1)
+            if args.target_mlm_accuracy:
+                if eval_avg_mlm_accuracy >= args.target_mlm_accuracy:
+                    if is_main_process():
+                        end = time.time()
+                        print('- AI-Rank-log ', end, ' test_finish')
+                        print('- AI-Rank-log ', end, ' total_use_time:', (end - start), 'sec')
+                        return args, final_loss, train_time_raw, global_step
             epoch += 1
 
 
@@ -857,6 +878,6 @@ if __name__ == "__main__":
         e2e_time = time.time() - now
         training_perf = args.train_batch_size * args.gradient_accumulation_steps * gpu_count\
                         * (global_step - args.resume_step + skipped_steps) / train_time_raw
-        dllogger.log(step=tuple(), data={"e2e_train_time": e2e_time, "training_sequences_per_second": training_perf,
-                                         "final_loss": final_loss, "raw_train_time": train_time_raw })
+        # dllogger.log(step=tuple(), data={"e2e_train_time": e2e_time, "training_sequences_per_second": training_perf,
+        #                                  "final_loss": final_loss, "raw_train_time": train_time_raw })
     dllogger.flush()
