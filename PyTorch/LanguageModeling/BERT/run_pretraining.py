@@ -263,12 +263,12 @@ def parse_arguments():
                         action='store_true',
                         help="Whether to use gradient checkpointing")
     parser.add_argument("--resume_from_checkpoint",
-                        default=False,
+                        default=True,
                         action='store_true',
                         help="Whether to resume training from checkpoint.")
     parser.add_argument('--resume_step',
                         type=int,
-                        default=-1,
+                        default=5392,
                         help="Step to resume training from.")
     parser.add_argument('--num_steps_per_checkpoint',
                         type=int,
