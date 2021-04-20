@@ -263,12 +263,12 @@ def parse_arguments():
                         action='store_true',
                         help="Whether to use gradient checkpointing")
     parser.add_argument("--resume_from_checkpoint",
-                        default=True,
+                        default=False,
                         action='store_true',
                         help="Whether to resume training from checkpoint.")
     parser.add_argument('--resume_step',
                         type=int,
-                        default=5392,
+                        default=-1,
                         help="Step to resume training from.")
     parser.add_argument('--num_steps_per_checkpoint',
                         type=int,
@@ -764,12 +764,19 @@ def main():
                             eval_avg_loss, eval_avg_mlm_accuracy = run_eval(args, model, eval_dataloader, device, args.num_eval_examples,
                                                                             first_eval=(eval_count == 0), use_cache=args.cache_eval_data)
                             if is_main_process():
-                                print({"epoch": epoch, "global_steps": global_step, "eval_loss": eval_avg_loss, "eval_mlm_accuracy":eval_avg_mlm_accuracy})
+                                print('- AI-Rank-log ', time.time(), ' eval_accuracy:', eval_avg_mlm_accuracy,
+                                      ', global_step:', global_step)
+                            eval_count += 1
                             if args.target_mlm_accuracy:
                                 if eval_avg_mlm_accuracy >= args.target_mlm_accuracy:
                                     end_training, converged = True, True
                                     if is_main_process():
-                                        print("%f > %f, Target MLM Accuracy reached at %d"%(eval_avg_mlm_accuracy, args.target_mlm_accuracy, global_step))
+                                        end = time.time()
+                                        print('- AI-Rank-log ', end, ' test_finish')
+                                        print('- AI-Rank-log ', end, ' total_use_time:', (end - start), 'sec')
+                                        print('- AI-Rank-log ', end, ' avg_ips:', (epoch * 10) / (end - start),
+                                              'samples/sec')
+                                        return args, final_loss, train_time_raw, global_step
 
                             eval_count += 1
                     # For mlm_accuracy
